@@ -1,0 +1,21 @@
+{
+    "production_start_time": "2025-09-18T19:30:16.527565",
+    "stirrers": {
+        "stirrer_1": {
+            "stirrer_name": "Stirrer 1",
+            "steps": {
+                "step_1": {
+                    "chemical": "sdfghjk",
+                    "target_weight_kg": 0.36,
+                    "dispensed_weight_kg": 0.54,
+                    "progress_percent": 150.0,
+                    "status": "Complete",
+                    "last_updated": "2025-09-18T19:30:18.651867",
+                    "source_tank": "Tank 1",
+                    "tank_contents": "APR362",
+                    "tank_number": 1
+                }
+            }
+        }
+    }
+}

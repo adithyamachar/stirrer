@@ -1,0 +1,46 @@
+{
+  "timestamp": 1756637034.602959,
+  "save_time_readable": "2025-08-31 16:13:54",
+  "stirrer_processes": {
+    "1": {
+      "stirrer_name": "Stirrer 1",
+      "product": "as",
+      "total_amount": 2,
+      "current_step": 1,
+      "status": "Complete",
+      "start_time": 1756636998.4990966,
+      "steps": [
+        {
+          "tank": "tank1",
+          "chemical": "asd",
+          "target_weight": 0.24,
+          "dispensed_weight": 0.38,
+          "start_weight": -0.06,
+          "status": "Complete",
+          "percentage": 12,
+          "step_complete": true
+        }
+      ]
+    },
+    "2": {
+      "stirrer_name": "Stirrer 2",
+      "product": "as",
+      "total_amount": 3,
+      "current_step": 1,
+      "status": "Complete",
+      "start_time": 1756636998.4990966,
+      "steps": [
+        {
+          "tank": "tank2",
+          "chemical": "asd",
+          "target_weight": 0.36,
+          "dispensed_weight": 0.9,
+          "start_weight": 0.9,
+          "status": "Complete",
+          "percentage": 12,
+          "step_complete": true
+        }
+      ]
+    }
+  }
+}

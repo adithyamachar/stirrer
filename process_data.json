@@ -1,0 +1,10 @@
+{
+    "step1": {
+        "tank": "tank1",
+        "tank_name": "Tank 1",
+        "tank_number": 1,
+        "chemical": "sdfghjk",
+        "weight": "0.360kg",
+        "stirrer": "Stirrer 1"
+    }
+}
