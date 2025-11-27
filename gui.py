@@ -11,32 +11,80 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
+import serial
 
+
+TANK_STIRRER_PINS = {
+    "tank1_stirrer1": 4,
+    "tank1_stirrer2": 17,
+    "tank1_stirrer3": 27,
+    "tank1_stirrer4": 22,
+
+    "tank2_stirrer1": 10,  # SPI MOSI (safe if SPI disabled)
+    "tank2_stirrer2": 9,   # SPI MISO (safe if SPI disabled)
+    "tank2_stirrer3": 12,  # moved from 11
+    "tank2_stirrer4": 5,
+
+    "tank3_stirrer1": 6,
+    "tank3_stirrer2": 13,
+    "tank3_stirrer3": 19,
+    "tank3_stirrer4": 26,
+
+    "tank4_stirrer1": 20,  # moved from 14 (safe)
+    "tank4_stirrer2": 21,  # moved from 15 (safe)
+    "tank4_stirrer3": 1,   # ? moved from 16 (GPIO 1 is safe, not toggled)
+    "tank4_stirrer4": 23,
+
+    "tank5_stirrer1": 24,
+    "tank5_stirrer2": 25,
+    "tank5_stirrer3": 7,   # avoid SPI CE1 if SPI disabled
+    "tank5_stirrer4": 8    # avoid SPI CE0 if SPI disabled
+}
+
+def reset_all_gpio():
+    """Set all pins HIGH safely at program exit"""
+    try:
+        for pin in TANK_STIRRER_PINS.values():
+            GPIO.output(pin, GPIO.HIGH)
+        GPIO.cleanup()
+        print("? All GPIO pins reset to HIGH and cleaned up.")
+    except Exception as e:
+        print(f"?? Error during GPIO reset: {e}")
+
+
+import RPi.GPIO as GPIO  # make sure GPIO is imported at the top
+
+# Setup GPIO once at program start
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+for pin in TANK_STIRRER_PINS.values():
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.HIGH)
 # ---------------- PATHS ----------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PRODUCTS_DIR = os.path.join(SCRIPT_DIR, "products")
 TANKS_FILE = os.path.join(SCRIPT_DIR, "tanks.json")
 PROCESS_FILE = os.path.join(SCRIPT_DIR, "process_data.json")
 DISPENSING_LOG_FILE = os.path.join(SCRIPT_DIR, "dispensing_log.json")
-GPIO_MAP_FILE = os.path.join(SCRIPT_DIR, "gpio_map.json")
 
 os.makedirs(PRODUCTS_DIR, exist_ok=True)
 
 # ---------------- SERIAL ----------------
-import serial
-
-
-def configure_serial(port='COM10', baudrate=19600, timeout=0.05):
+def configure_serial(port='/dev/ttyUSB0', baudrate=19200, timeout=0.05):
     """Always use very small timeout to avoid blocking."""
-    return serial.Serial(
-        port=port,
-        baudrate=baudrate,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=timeout
-    )
-
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=timeout
+        )
+        return ser
+    except Exception as e:
+        print(f"Serial config error: {e}")
+        return None
 
 def read_weight(ser, channel):
     """Non-blocking weight read"""
@@ -45,8 +93,8 @@ def read_weight(ser, channel):
             return None
         cmd = f"{channel}0\r".encode()
         ser.write(cmd)
-        time.sleep(0.02)  # tiny delay
-        resp = ser.read(ser.in_waiting or 1)  # non-blocking
+        time.sleep(0.1)
+        resp = ser.read(ser.in_waiting or 1)
         if not resp:
             return None
         text = resp.decode('ascii', errors='ignore').strip()
@@ -55,41 +103,25 @@ def read_weight(ser, channel):
     except Exception:
         return None
 
-
-# ---------------- DISPENSING LOG FUNCTIONS ----------------
+# ---------------- DISPENSING LOG ----------------
 def initialize_dispensing_log():
-    """Initialize or reset the dispensing log for a new production run"""
-    log_data = {
-        "production_start_time": datetime.now().isoformat(),
-        "stirrers": {}
-    }
-
+    log_data = {"production_start_time": datetime.now().isoformat(), "stirrers": {}}
     with open(DISPENSING_LOG_FILE, "w") as f:
         json.dump(log_data, f, indent=4)
-
     return log_data
 
-
-def update_dispensing_log(stirrer_num, step_num, chemical, target_weight, dispensed_weight, status, tank_name=None,
-                          tank_contents=None, tank_number=None):
-    """Update the dispensing log with current step progress including tank information"""
+def update_dispensing_log(stirrer_num, step_num, chemical, target_weight, dispensed_weight, status, tank_name=None, tank_contents=None, tank_number=None):
     try:
-        # Load existing log
         if os.path.exists(DISPENSING_LOG_FILE):
             with open(DISPENSING_LOG_FILE, "r") as f:
                 log_data = json.load(f)
         else:
             log_data = initialize_dispensing_log()
 
-        # Initialize stirrer section if not exists
         stirrer_key = f"stirrer_{stirrer_num}"
         if stirrer_key not in log_data["stirrers"]:
-            log_data["stirrers"][stirrer_key] = {
-                "stirrer_name": f"Stirrer {stirrer_num}",
-                "steps": {}
-            }
+            log_data["stirrers"][stirrer_key] = {"stirrer_name": f"Stirrer {stirrer_num}", "steps": {}}
 
-        # Update step data with tank information
         step_key = f"step_{step_num}"
         step_data = {
             "chemical": chemical,
@@ -100,7 +132,6 @@ def update_dispensing_log(stirrer_num, step_num, chemical, target_weight, dispen
             "last_updated": datetime.now().isoformat()
         }
 
-        # Add tank information if provided
         if tank_name:
             step_data["source_tank"] = tank_name
         if tank_contents:
@@ -110,26 +141,19 @@ def update_dispensing_log(stirrer_num, step_num, chemical, target_weight, dispen
 
         log_data["stirrers"][stirrer_key]["steps"][step_key] = step_data
 
-        # Save updated log
         with open(DISPENSING_LOG_FILE, "w") as f:
             json.dump(log_data, f, indent=4)
-
     except Exception as e:
-        print(f"Error updating dispensing log: {str(e)}")
-
+        print(f"Error updating dispensing log: {e}")
 
 # ---------------- MAIN WINDOW ----------------
 class MainWindow(QMainWindow):
-    NUM_TANKS = 25        # user specified: 25 tanks
-    NUM_STIRRERS = 4      # user specified: 4 stirrers
-    GPIO_TANK_LIMIT = 5   # only tanks 1..5 will get GPIO mappings
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Production Control")
         self.setGeometry(300, 200, 1200, 800)
 
-        # widgets - initialize to None
+        # widgets
         self.main_menu_widget = None
         self.batch_widget = None
         self.product_widget = None
@@ -139,193 +163,38 @@ class MainWindow(QMainWindow):
 
         # process state
         self.ser = None
-        self.stirrer_processes = {}  # Store process data for each stirrer
-        self.stirrer_tables = {}  # Store table widgets for each stirrer
-        self.stirrer_labels = {}  # Store status labels for each stirrer
-        self.tanks_data = {}  # Store tank information
+        self.stirrer_processes = {}
+        self.stirrer_tables = {}
+        self.stirrer_labels = {}
+        self.tanks_data = {}
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_process)
 
-        # GPIO state
-        self.gpio_map = {}
-        self.gpio_sim = False  # if True, we simulate GPIO (print) instead of real RPi.GPIO
-        self.available_pins = [
-            2, 3, 4, 17, 27, 22, 10, 9, 11, 5, 6, 13, 19, 26, 14, 15, 18, 23, 24, 25,
-            8, 7, 12, 16, 20, 21
-        ]  # common BCM pins list (may be adapted by user)
-        self.active_outputs = set()  # currently ON outputs as keys 'tank{n}_stirrer{m}'
-        self.paused_outputs = set()  # remember outputs that were on when paused
-
-        # attempt to load gpio mapping and initialize gpio
-        self.load_gpio_map()
-        self.init_gpio()
-
-        # Load tank data
         self.load_tanks_data()
-
-        # Start with main menu
         self.show_main_menu()
 
-    # ---------- GPIO Helpers ----------
-    def load_gpio_map(self):
-        """Load (or create) a gpio mapping file mapping each tank+stirrer combo to a BCM pin.
-        Only tanks 1..GPIO_TANK_LIMIT receive pins; others map to None."""
-        try:
-            if os.path.exists(GPIO_MAP_FILE):
-                with open(GPIO_MAP_FILE, "r") as f:
-                    self.gpio_map = json.load(f)
-            else:
-                # create default mapping for only tanks 1..GPIO_TANK_LIMIT
-                needed = self.GPIO_TANK_LIMIT * self.NUM_STIRRERS
-                pins = []
-                idx = 0
-                while len(pins) < needed:
-                    pins.append(self.available_pins[idx % len(self.available_pins)])
-                    idx += 1
-
-                mapping = {}
-                k = 0
-                for t in range(1, self.NUM_TANKS + 1):
-                    for s in range(1, self.NUM_STIRRERS + 1):
-                        key = f"tank{t}_stirrer{s}"
-                        if t <= self.GPIO_TANK_LIMIT:
-                            mapping[key] = pins[k]
-                            k += 1
-                        else:
-                            mapping[key] = None  # explicitly no GPIO for these tanks
-
-                self.gpio_map = mapping
-                with open(GPIO_MAP_FILE, "w") as f:
-                    json.dump(self.gpio_map, f, indent=2)
-        except Exception as e:
-            print(f"Error loading gpio map: {e}")
-            self.gpio_map = {}
-
-    def init_gpio(self):
-        """Try to initialize RPi.GPIO. If not present, fall back to simulation mode."""
-        try:
-            import RPi.GPIO as GPIO
-            self.GPIO = GPIO
-            GPIO.setmode(GPIO.BCM)
-            # set all mapped pins as outputs and set LOW (only non-None pins)
-            unique_pins = {p for p in self.gpio_map.values() if p is not None}
-            for p in unique_pins:
-                try:
-                    GPIO.setup(p, GPIO.OUT)
-                    GPIO.output(p, GPIO.LOW)
-                except Exception as e:
-                    print(f"GPIO setup error for pin {p}: {e}")
-                    # if any pin fails, switch to simulation to avoid runtime crashes
-                    self.gpio_sim = True
-                    break
-            if not getattr(self, "gpio_sim", False):
-                self.gpio_sim = False
-        except Exception:
-            # RPi.GPIO not available: enable simulation
-            self.gpio_sim = True
-            self.GPIO = None
-            print("RPi.GPIO not available — running in GPIO simulation mode (no hardware changes).")
-
-    def set_output(self, tank_number, stirrer_number, on: bool):
-        """Set GPIO corresponding to tank{n}_stirrer{m} to on/off. Handles simulation fallback.
-        If mapping is None (no pin assigned), this is a no-op."""
-        key = f"tank{tank_number}_stirrer{stirrer_number}"
-        pin = self.gpio_map.get(key)
-        if pin is None:
-            # no mapping - nothing to do
-            return
-
-        try:
-            if self.gpio_sim or not hasattr(self, "GPIO") or self.GPIO is None:
-                # simulation mode
-                if on:
-                    self.active_outputs.add(key)
-                    print(f"[GPIO SIM] SET {key} -> PIN {pin} HIGH")
-                else:
-                    if key in self.active_outputs:
-                        self.active_outputs.discard(key)
-                    print(f"[GPIO SIM] SET {key} -> PIN {pin} LOW")
-            else:
-                # hardware mode
-                if on:
-                    self.GPIO.output(pin, self.GPIO.HIGH)
-                    self.active_outputs.add(key)
-                else:
-                    self.GPIO.output(pin, self.GPIO.LOW)
-                    if key in self.active_outputs:
-                        self.active_outputs.discard(key)
-        except Exception as e:
-            print(f"Error setting GPIO {pin} for {key}: {e}")
-
-    def cleanup_gpio(self):
-        """Turn off all outputs and cleanup GPIO if using real hardware."""
-        try:
-            # turn off all mapped pins
-            for key, pin in self.gpio_map.items():
-                try:
-                    if pin is None:
-                        continue
-                    if self.gpio_sim or not hasattr(self, "GPIO") or self.GPIO is None:
-                        if key in self.active_outputs:
-                            print(f"[GPIO SIM] CLEANUP: SET {key} -> PIN {pin} LOW")
-                        self.active_outputs.discard(key)
-                    else:
-                        self.GPIO.output(pin, self.GPIO.LOW)
-                        self.active_outputs.discard(key)
-                except Exception:
-                    pass
-            if not self.gpio_sim and hasattr(self, "GPIO") and self.GPIO is not None:
-                try:
-                    self.GPIO.cleanup()
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"Error cleaning up GPIO: {e}")
-
-    # -------- Tanks data ----------
     def load_tanks_data(self):
-        """Load tank data for reference during production"""
         try:
             if os.path.exists(TANKS_FILE):
                 with open(TANKS_FILE, "r") as f:
                     tanks_list = json.load(f)
-                # Convert to dict for easy lookup
-                self.tanks_data = {}
-                for i, tank in enumerate(tanks_list):
-                    tank_key = f"tank{i + 1}"
-                    self.tanks_data[tank_key] = {
-                        "name": tank.get("name", f"Tank {i + 1}"),
-                        "contents": tank.get("contents", "")
-                    }
+                self.tanks_data = {f"tank{i+1}": {"name": t.get("name", f"Tank {i+1}"), "contents": t.get("contents", "")} for i, t in enumerate(tanks_list)}
             else:
-                # Default tank data: now NUM_TANKS tanks
-                tanks_default = [{"name": f"Tank {i + 1}", "contents": ""} for i in range(self.NUM_TANKS)]
-                with open(TANKS_FILE, "w") as f:
-                    json.dump(tanks_default, f, indent=2)
-                self.tanks_data = {f"tank{i}": {"name": f"Tank {i}", "contents": ""} for i in range(1, self.NUM_TANKS + 1)}
+                self.tanks_data = {f"tank{i}": {"name": f"Tank {i}", "contents": ""} for i in range(1, 9)}
         except Exception as e:
-            print(f"Error loading tanks data: {str(e)}")
-            self.tanks_data = {f"tank{i}": {"name": f"Tank {i}", "contents": ""} for i in range(1, self.NUM_TANKS + 1)}
+            print(f"Error loading tanks: {e}")
+            self.tanks_data = {f"tank{i}": {"name": f"Tank {i}", "contents": ""} for i in range(1, 9)}
 
-    # -------- Main Menu --------
+    # ---------------- MAIN MENU ----------------
     def show_main_menu(self):
-        """Create and show the main menu (recreate each time to avoid widget issues)"""
         self.main_menu_widget = QWidget()
         layout = QVBoxLayout(self.main_menu_widget)
         layout.setAlignment(Qt.AlignCenter)
         layout.setSpacing(30)
 
         button_style = """
-            QPushButton {
-                background-color: #2E86C1;
-                color: white;
-                border-radius: 12px;
-                font-size: 18px;
-                padding: 12px 24px;
-            }
-            QPushButton:hover {
-                background-color: #3498DB;
-            }
+            QPushButton { background-color: #2E86C1; color: white; border-radius: 12px; font-size: 18px; padding: 12px 24px; }
+            QPushButton:hover { background-color: #3498DB; }
         """
 
         self.btn_batch = QPushButton("Batch Production")
@@ -349,30 +218,23 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(self.main_menu_widget)
 
-    # -------- Dispensing Log Viewer --------
+    # ---------------- DISPENSING LOG ----------------
     def open_dispensing_log(self):
-        """Open the dispensing log viewer"""
         self.stop_process()
-
         self.dispensing_log_widget = QWidget()
         layout = QVBoxLayout(self.dispensing_log_widget)
 
-        # Title
         title = QLabel("Dispensing Log")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        # Log display area
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setFont(QFont("Courier", 10))
         layout.addWidget(self.log_display)
-
-        # Load and display log
         self.load_and_display_log()
 
-        # Buttons
         btn_layout = QHBoxLayout()
         btn_refresh = QPushButton("Refresh")
         btn_clear = QPushButton("Clear Log")
@@ -382,64 +244,38 @@ class MainWindow(QMainWindow):
         btn_clear.clicked.connect(self.clear_dispensing_log)
         btn_back.clicked.connect(self.go_back_to_main)
 
-        btn_layout.addWidget(btn_refresh)
-        btn_layout.addWidget(btn_clear)
-        btn_layout.addWidget(btn_back)
+        for b in (btn_refresh, btn_clear, btn_back):
+            btn_layout.addWidget(b)
         layout.addLayout(btn_layout)
 
         self.setCentralWidget(self.dispensing_log_widget)
 
     def load_and_display_log(self):
-        """Load and display the dispensing log in a formatted way with tank information"""
         try:
             if not os.path.exists(DISPENSING_LOG_FILE):
-                self.log_display.setText("No dispensing log found. Start a production run to create one.")
+                self.log_display.setText("No dispensing log found.")
                 return
-
             with open(DISPENSING_LOG_FILE, "r") as f:
                 log_data = json.load(f)
 
-            # Format the log for display
-            display_text = f"Production Started: {log_data.get('production_start_time', 'Unknown')}\n"
-            display_text += "=" * 80 + "\n\n"
-
-            for stirrer_key, stirrer_data in log_data.get("stirrers", {}).items():
-                stirrer_name = stirrer_data.get("stirrer_name", stirrer_key)
-                display_text += f">>> {stirrer_name} <<<\n"
-                display_text += "-" * 40 + "\n"
-
-                steps = stirrer_data.get("steps", {})
+            text = f"Production Started: {log_data.get('production_start_time', 'Unknown')}\n" + "="*80 + "\n\n"
+            for stirrer_key, sdata in log_data.get("stirrers", {}).items():
+                text += f">>> {sdata.get('stirrer_name')} <<<\n"
+                steps = sdata.get("steps", {})
                 if not steps:
-                    display_text += "No steps recorded.\n\n"
+                    text += "No steps recorded.\n\n"
                     continue
-
-                for step_key in sorted(steps.keys(), key=lambda x: int(x.split('_')[1])):
-                    step_data = steps[step_key]
-                    display_text += f"{step_key.replace('_', ' ').title()}:\n"
-                    display_text += f"  Chemical: {step_data.get('chemical', 'Unknown')}\n"
-
-                    # Add tank information if available
-                    if 'source_tank' in step_data:
-                        tank_info = f"  Source Tank: {step_data['source_tank']}"
-                        if 'tank_contents' in step_data and step_data['tank_contents']:
-                            tank_info += f" (Contains: {step_data['tank_contents']})"
-                        if 'tank_number' in step_data:
-                            tank_info += f" - Tank #{step_data['tank_number']}"
-                        display_text += tank_info + "\n"
-
-                    display_text += f"  Target Weight: {step_data.get('target_weight_kg', 0):.3f} kg\n"
-                    display_text += f"  Dispensed Weight: {step_data.get('dispensed_weight_kg', 0):.3f} kg\n"
-                    display_text += f"  Progress: {step_data.get('progress_percent', 0):.1f}%\n"
-                    display_text += f"  Status: {step_data.get('status', 'Unknown')}\n"
-                    display_text += f"  Last Updated: {step_data.get('last_updated', 'Unknown')}\n"
-                    display_text += "\n"
-
-                display_text += "\n"
-
-            self.log_display.setText(display_text)
-
+                for step_key in sorted(steps.keys(), key=lambda x:int(x.split('_')[1])):
+                    step = steps[step_key]
+                    text += f"{step_key}:\n  Chemical: {step.get('chemical')}\n  Target: {step.get('target_weight_kg')} kg\n  Dispensed: {step.get('dispensed_weight_kg')} kg\n  Progress: {step.get('progress_percent')}%\n  Status: {step.get('status')}\n"
+                    if 'source_tank' in step:
+                        tank_info = f"  Source Tank: {step['source_tank']}"
+                        if 'tank_contents' in step: tank_info += f" ({step['tank_contents']})"
+                        text += tank_info + "\n"
+                    text += "\n"
+            self.log_display.setText(text)
         except Exception as e:
-            self.log_display.setText(f"Error loading dispensing log: {str(e)}")
+            self.log_display.setText(f"Error: {e}")
 
     def clear_dispensing_log(self):
         """Clear the dispensing log after confirmation"""
@@ -498,7 +334,7 @@ class MainWindow(QMainWindow):
                 with open(TANKS_FILE, "r") as f:
                     tanks_data = json.load(f)
             else:
-                tanks_data = [{"name": f"Tank {i + 1}", "contents": ""} for i in range(self.NUM_TANKS)]
+                tanks_data = [{"name": f"Tank {i + 1}", "contents": ""} for i in range(8)]
                 with open(TANKS_FILE, "w") as f:
                     json.dump(tanks_data, f, indent=2)
 
@@ -553,8 +389,8 @@ class MainWindow(QMainWindow):
         self.stirrer_table = QTableWidget()
         self.stirrer_table.setColumnCount(3)
         self.stirrer_table.setHorizontalHeaderLabels(["Select", "Product", "Amount"])
-        # only NUM_STIRRERS stirrers now
-        self.stirrer_table.setRowCount(self.NUM_STIRRERS)
+        # <<-- changed: only 4 stirrers now
+        self.stirrer_table.setRowCount(4)
 
         try:
             products = [f[:-5] for f in os.listdir(PRODUCTS_DIR) if f.endswith(".json")]
@@ -563,7 +399,8 @@ class MainWindow(QMainWindow):
         except Exception:
             products = ["Error loading products"]
 
-        for row in range(self.NUM_STIRRERS):
+        # <<-- changed: iterate only 4 stirrers
+        for row in range(4):
             chk = QCheckBox(f"Stirrer {row + 1}")
             self.stirrer_table.setCellWidget(row, 0, chk)
 
@@ -681,7 +518,7 @@ class MainWindow(QMainWindow):
 
                 # Open production monitor
                 self.open_production_monitor()
-                self.update_timer.start(200)
+                self.update_timer.start(100)
 
             else:
                 QMessageBox.information(self, "No Selection", "No valid stirrers selected for production.")
@@ -782,186 +619,165 @@ class MainWindow(QMainWindow):
         """Pause or resume production"""
         try:
             if self.update_timer.isActive():
-                # Pausing: stop timer and turn off active GPIO outputs, record which were active
                 self.update_timer.stop()
                 self.btn_pause.setText("Resume Production")
                 self.btn_pause.setStyleSheet("background-color: #2ECC71; color: white; padding: 8px;")
-                # remember active outputs and turn them off
-                self.paused_outputs = set(self.active_outputs)
-                for key in list(self.paused_outputs):
-                    # key is like 'tankX_stirrerY'
-                    try:
-                        parts = key.replace("tank", "").split("_stirrer")
-                        t = int(parts[0])
-                        s = int(parts[1])
-                        self.set_output(t, s, False)
-                    except Exception:
-                        pass
                 for lbl in self.stirrer_labels.values():
-                    # append paused note, but avoid adding duplicate '| Paused'
-                    if "| Paused" not in lbl.text():
-                        lbl.setText(lbl.text() + " | Paused")
+                    lbl.setText(lbl.text() + " | Paused")
             else:
-                # Resuming: start timer and re-enable outputs that were paused for steps still dispensing
                 self.update_timer.start(200)
                 self.btn_pause.setText("Pause Production")
                 self.btn_pause.setStyleSheet("background-color: #F39C12; color: white; padding: 8px;")
-                # Re-enable GPIOs for steps that are still 'Dispensing'
-                for key in list(self.paused_outputs):
-                    try:
-                        parts = key.replace("tank", "").split("_stirrer")
-                        t = int(parts[0])
-                        s = int(parts[1])
-                        # only re-enable if that stirrer's current step is still dispensing and uses that tank
-                        proc = self.stirrer_processes.get(s)
-                        if proc:
-                            idx = proc.get("current_step", 0)
-                            if idx < len(proc["steps"]):
-                                cur = proc["steps"][idx]
-                                if cur["tank_number"] == t and cur["status"] == "Dispensing":
-                                    self.set_output(t, s, True)
-                    except Exception:
-                        pass
-                self.paused_outputs.clear()
-                # remove paused note
-                for lbl in self.stirrer_labels.values():
-                    text = lbl.text()
-                    lbl.setText(text.replace(" | Paused", ""))
         except Exception as e:
             print(f"Error toggling pause: {e}")
 
     def update_process(self):
-        """Update the production process and GUI displays - now sequential stirrers"""
+        """Update process with fixed baseline - never changes once set"""
         try:
-            # If we have no stirrers, stop
+            # Check if we have active stirrers
             if not self.stirrer_processes:
                 self.stop_process()
                 return
 
-            # Determine which stirrer is currently active
+            # Get active stirrers in order
             active_stirrers = sorted(self.stirrer_processes.keys())
             if not hasattr(self, "current_stirrer_index"):
                 self.current_stirrer_index = 0
 
+            # Check if all stirrers complete
             if self.current_stirrer_index >= len(active_stirrers):
-                # All stirrers are complete
                 self.stop_process()
-                QMessageBox.information(self, "Production Complete",
-                                        "All stirrers completed successfully!")
+                QMessageBox.information(self, "Production Complete", "All stirrers completed successfully!")
                 return
 
-            current_stirrer_num = active_stirrers[self.current_stirrer_index]
-            proc_data = self.stirrer_processes[current_stirrer_num]
+            # Get current stirrer
+            stirrer_num = active_stirrers[self.current_stirrer_index]
+            proc_data = self.stirrer_processes[stirrer_num]
 
-            # Skip if already complete and move to next stirrer
+            # Move to next stirrer if current is complete
             if proc_data["status"] == "Complete":
                 self.current_stirrer_index += 1
                 return
 
+            # Get current step
+            step_idx = proc_data["current_step"]
             steps = proc_data["steps"]
-            current_step_idx = proc_data["current_step"]
 
-            if current_step_idx >= len(steps):
+            # Check if all steps complete for this stirrer
+            if step_idx >= len(steps):
                 proc_data["status"] = "Complete"
-                self.stirrer_labels[current_stirrer_num].setText("Status: Production Complete ✓")
-                self.stirrer_labels[current_stirrer_num].setStyleSheet("color: green; font-weight: bold;")
-                self.current_stirrer_index += 1  # Move to next stirrer on next cycle
+                self.stirrer_labels[stirrer_num].setText("Status: Production Complete")
+                self.stirrer_labels[stirrer_num].setStyleSheet("color: green; font-weight: bold;")
+                self.current_stirrer_index += 1
                 return
 
-            current_step = steps[current_step_idx]
+            step = steps[step_idx]
+            tank_num = step["tank_number"]
+            channel = chr(ord('A') + (tank_num - 1))
 
-            # Get tank number → channel
-            tank_number = current_step["tank_number"]
-            channel = chr(ord('A') + (tank_number - 1))
-
+            # Read current weight
             current_weight = read_weight(self.ser, channel)
             if current_weight is None:
                 return
 
-            if current_step["start_weight"] == 0:
-                current_step["start_weight"] = current_weight
-                current_step["status"] = "Dispensing"
-                # Turn on the gpio for this tank/stirrer (if mapped)
-                try:
-                    self.set_output(tank_number, current_stirrer_num, True)
-                except Exception as e:
-                    print(f"Error setting GPIO ON for tank{tank_number}_stirrer{current_stirrer_num}: {e}")
+            # STEP 1: Initialize - capture FIXED baseline weight (never changes)
+            if step["status"] == "Waiting":
+                step["baseline_weight"] = current_weight  # FIXED - stored once and never updated
+                step["status"] = "Dispensing"
+                
+                print(f"[START] Tank {tank_num}, Step {step_idx + 1}: Baseline = {current_weight:.3f} kg")
+                
+                # Turn ON valve (GPIO LOW)
+                pin_name = f"tank{tank_num}_stirrer{stirrer_num}"
+                pin = TANK_STIRRER_PINS.get(pin_name)
+                if pin is not None:
+                    GPIO.output(pin, GPIO.LOW)
+                    print(f"[VALVE ON] {pin_name} (GPIO {pin})")
+                
+                return  # Wait for next cycle to start reading
 
-            dispensed = current_step["start_weight"] - current_weight
-            current_step["dispensed_weight"] = max(0, dispensed)
+            # STEP 2: Dispensing - always compare current to fixed baseline
+            baseline_weight = step.get("baseline_weight", current_weight)
+            dispensed = baseline_weight - current_weight
+            
+            # Prevent negative values from scale drift
+            if dispensed < 0:
+                dispensed = 0
+            
+            target = step["target_weight"]
+            progress = (dispensed / target * 100) if target > 0 else 0
 
-            target = current_step["target_weight"]
-            progress = min(100.0, (dispensed / target) * 100) if target > 0 else 0
+            print(f"[READING] Tank {tank_num}, Step {step_idx + 1}: Baseline={baseline_weight:.3f}, Current={current_weight:.3f}, Dispensed={dispensed:.3f}, Target={target:.3f}, Progress={progress:.1f}%")
+
+            # Update display
+            table = self.stirrer_tables[stirrer_num]
+            table.setItem(step_idx, 5, QTableWidgetItem(f"{dispensed:.3f}"))
+            table.setItem(step_idx, 6, QTableWidgetItem(f"{progress:.1f}%"))
+            table.setItem(step_idx, 7, QTableWidgetItem(step["status"]))
+
+            # Update status label
+            self.stirrer_labels[stirrer_num].setText(
+                f"Status: Step {step_idx + 1}/{len(steps)} - {step['chemical']} "
+                f"({progress:.1f}%) from Tank {tank_num} ({step['tank_name']})"
+            )
+
+            # Color coding
+            if progress < 100:
+                table.item(step_idx, 7).setBackground(Qt.yellow)
+                table.item(step_idx, 6).setBackground(Qt.yellow)
 
             # Log update
             update_dispensing_log(
-                current_stirrer_num,
-                current_step_idx + 1,
-                current_step["chemical"],
-                target,
-                dispensed,
-                current_step["status"],
-                current_step["tank_name"],
-                current_step["tank_contents"],
-                tank_number
+                stirrer_num, step_idx + 1, step["chemical"], target, dispensed,
+                step["status"], step["tank_name"], step["tank_contents"], tank_num
             )
 
-            table = self.stirrer_tables[current_stirrer_num]
-            table.setItem(current_step_idx, 5, QTableWidgetItem(f"{dispensed:.3f}"))
-            table.setItem(current_step_idx, 6, QTableWidgetItem(f"{progress:.1f}%"))
-            table.setItem(current_step_idx, 7, QTableWidgetItem(current_step["status"]))
+            # STEP 3: Check if target reached
+            if dispensed >= target:
+                # Mark complete
+                step["status"] = "Complete"
+                step["dispensed_weight"] = dispensed
+                
+                print(f"[COMPLETE] Tank {tank_num}, Step {step_idx + 1}: Dispensed {dispensed:.3f} kg (target was {target:.3f} kg)")
+                
+                # Turn OFF valve (GPIO HIGH)
+                pin_name = f"tank{tank_num}_stirrer{stirrer_num}"
+                pin = TANK_STIRRER_PINS.get(pin_name)
+                if pin is not None:
+                    GPIO.output(pin, GPIO.HIGH)
+                    print(f"[VALVE OFF] {pin_name} (GPIO {pin})")
 
-            if progress >= 100:
-                # Step complete: mark and turn off gpio
-                current_step["status"] = "Complete"
-                table.setItem(current_step_idx, 7, QTableWidgetItem("Complete"))
-                table.item(current_step_idx, 7).setBackground(Qt.green)
-                try:
-                    self.set_output(tank_number, current_stirrer_num, False)
-                except Exception as e:
-                    print(f"Error setting GPIO OFF for tank{tank_number}_stirrer{current_stirrer_num}: {e}")
+                # Update display to green
+                table.setItem(step_idx, 7, QTableWidgetItem("Complete"))
+                table.item(step_idx, 7).setBackground(Qt.green)
+                table.item(step_idx, 6).setBackground(Qt.green)
 
+                # Final log update
                 update_dispensing_log(
-                    current_stirrer_num,
-                    current_step_idx + 1,
-                    current_step["chemical"],
-                    target,
-                    dispensed,
-                    "Complete",
-                    current_step["tank_name"],
-                    current_step["tank_contents"],
-                    tank_number
+                    stirrer_num, step_idx + 1, step["chemical"], target, dispensed,
+                    "Complete", step["tank_name"], step["tank_contents"], tank_num
                 )
 
+                # Move to next step
                 proc_data["current_step"] += 1
-                if proc_data["current_step"] < len(steps):
-                    steps[proc_data["current_step"]]["start_weight"] = 0
-                else:
+                
+                # Check if stirrer finished all steps
+                if proc_data["current_step"] >= len(steps):
                     proc_data["status"] = "Complete"
-                    self.stirrer_labels[current_stirrer_num].setText("Status: Production Complete ✓")
-                    self.stirrer_labels[current_stirrer_num].setStyleSheet("color: green; font-weight: bold;")
-                    self.current_stirrer_index += 1  # Move to next stirrer after last step completes
-            else:
-                # update label with progress; leave GPIO on while dispensing
-                if progress > 0:
-                    table.item(current_step_idx, 6).setBackground(Qt.yellow)
-                    table.item(current_step_idx, 7).setBackground(Qt.yellow)
-
-                self.stirrer_labels[current_stirrer_num].setText(
-                    f"Status: Step {current_step_idx + 1}/{len(steps)} - "
-                    f"{current_step['chemical']} ({progress:.1f}%) "
-                    f"from Tank {tank_number} ({current_step['tank_name']})"
-                )
+                    self.stirrer_labels[stirrer_num].setText("Status: Production Complete")
+                    self.stirrer_labels[stirrer_num].setStyleSheet("color: green; font-weight: bold;")
+                    self.current_stirrer_index += 1
 
         except Exception as e:
-            print(f"Error in update_process: {str(e)}")
-            self.stop_process()
+            print(f"Error in update_process: {e}")
 
     def stop_production(self):
         """Stop production and return to batch setup"""
         self.stop_process()
         QMessageBox.information(self, "Production Stopped", "Production has been stopped.")
         self.open_batch_production()
+        for pin in TANK_STIRRER_PINS.values():
+            GPIO.output(pin, GPIO.HIGH)
 
     # -------- Product Configurations --------
     def open_product_configurations(self):
@@ -991,10 +807,10 @@ class MainWindow(QMainWindow):
             perc_spin.setDecimals(2)
             self.product_table.setCellWidget(row, 1, perc_spin)
 
-            # Tank number spinbox - allow up to NUM_TANKS
+            # Tank number spinbox
             tank_spin = QSpinBox()
-            tank_spin.setRange(1, self.NUM_TANKS)
-            tank_spin.setValue(row + 1 if row + 1 <= self.NUM_TANKS else 1)  # Default to sequential tank numbers
+            tank_spin.setRange(1, 8)
+            tank_spin.setValue(row + 1)  # Default to sequential tank numbers
             self.product_table.setCellWidget(row, 2, tank_spin)
 
         layout.addWidget(self.product_table)
@@ -1040,8 +856,8 @@ class MainWindow(QMainWindow):
 
         # Tank number spinbox
         tank_spin = QSpinBox()
-        tank_spin.setRange(1, self.NUM_TANKS)
-        tank_spin.setValue(row + 1 if row + 1 <= self.NUM_TANKS else 1)
+        tank_spin.setRange(1, 8)
+        tank_spin.setValue(row + 1 if row < 8 else 1)
         self.product_table.setCellWidget(row, 2, tank_spin)
 
         # Type column
@@ -1106,11 +922,7 @@ class MainWindow(QMainWindow):
 
                     tank_widget = self.product_table.cellWidget(i, 2)
                     if tank_widget:
-                        tval = mat.get("tank", i + 1)
-                        if isinstance(tval, int) and 1 <= tval <= self.NUM_TANKS:
-                            tank_widget.setValue(tval)
-                        else:
-                            tank_widget.setValue(1)
+                        tank_widget.setValue(mat.get("tank", i + 1))
 
                     self.product_table.setItem(i, 3, QTableWidgetItem(mat.get("type", "")))
 
@@ -1137,9 +949,6 @@ class MainWindow(QMainWindow):
                     raw_material = raw_item.text().strip()
                     perc = perc_widget.value() if isinstance(perc_widget, QDoubleSpinBox) else 0.0
                     tank = tank_widget.value() if isinstance(tank_widget, QSpinBox) else 1
-                    # clamp tank to valid range
-                    if tank < 1 or tank > self.NUM_TANKS:
-                        tank = 1
                     type_val = type_item.text().strip() if type_item else ""
 
                     if perc > 0:
@@ -1186,16 +995,14 @@ class MainWindow(QMainWindow):
 
         self.ser = None
 
-        # Turn off any GPIO outputs that may be on
-        try:
-            self.cleanup_gpio()
-        except Exception:
-            pass
-
         # Clear process data
+        if hasattr(self, 'current_stirrer_index'):
+            delattr(self, 'current_stirrer_index')
         self.stirrer_processes = {}
         self.stirrer_tables = {}
         self.stirrer_labels = {}
+        for pin in TANK_STIRRER_PINS.values():
+            GPIO.output(pin, GPIO.HIGH)
 
     def go_back_to_main(self):
         """Safely return to main menu"""
@@ -1213,12 +1020,9 @@ class MainWindow(QMainWindow):
         self.show_main_menu()
 
     def closeEvent(self, event):
+        for pin in TANK_STIRRER_PINS.values():
+            GPIO.output(pin, GPIO.HIGH)
         """Handle application close"""
-        # cleanup gpio on exit
-        try:
-            self.cleanup_gpio()
-        except Exception:
-            pass
         self.stop_process()
         event.accept()
 
